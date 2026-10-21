@@ -1,0 +1,30 @@
+# Environment & Secrets (DO NOT COMMIT!)
+.env
+.env.local
+*.env
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data & Persistence
+data/
+storage/
+*.db
+*.sqlite
+*.log
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
