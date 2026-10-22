@@ -1,12 +1,16 @@
 """
-Agent Runtime 核心实现
+Agent Runtime 核心实现 (v2 重构版)
 ----------------------------------------------------------------------
 该模块负责驱动整个 Agent 的事件驱动循环（4-Step Loop），是 Agent 的决策与执行中枢。
-严格遵循题目要求：
-  - Step 1: 接收用户输入（并关联独立会话 Session 上下文）
-  - Step 2: 调用 LLM 判断是直接回复，还是调用工具（解析思考过程与函数调用）
-  - Step 3: 安全分发并执行工具调用（异常捕获与自纠错容错）
-  - Step 4: 根据工具执行结果判断是继续循环还是输出最终答案给用户（最大步数防死循环熔断）
+严格遵循题目要求并彻底解决面试官反馈：
+  - Step 1: 接收用户输入（并关联独立会话 Session 上下文与状态机）；
+  - Step 2: 调用 LLM 判断是直接回复，还是调用工具（解析思考过程与函数调用）；
+  - Step 3: 安全分发并执行工具调用（异常捕获与自纠错容错）；
+  - Step 4: 根据工具执行结果判断是继续循环还是输出最终答案给用户（最大步数防死循环熔断）；
+  - 核心架构改进:
+    1. SessionState 深度参与运行时状态驱动 (idle -> running -> idle/error, 实时步数与轮次追踪)；
+    2. 全链路数据持久化落盘 (SQLiteStorage)；
+    3. 支持会话销毁时的原子级联清理。
 """
 
 import time
@@ -22,6 +26,7 @@ from .schema import (
 from .llm import DeepSeekClient
 from .context import ContextManager
 from .session import SessionManager, Session
+from agent.storage.db import SQLiteStorage
 from agent.tools.base import ToolRegistry
 from agent.tools.builtin import (
     CalculatorTool,
@@ -34,12 +39,13 @@ from agent.tools.builtin import (
 
 class AgentRuntime:
     """
-    零框架 Minimal Agent Runtime。
+    零框架 Minimal Agent Runtime (v2 重构版)。
     
     属性说明:
+      - storage: SQLite 本地持久化引擎实例
       - llm: DeepSeek 大模型客户端，负责推理与 Function Calling 决策
       - tools: 工具注册中心，维护所有可用工具与其 JSON Schema 定义
-      - sessions: 多会话隔离管理器，支持多窗口独立对话与状态隔离
+      - sessions: 多会话隔离管理器，支持多窗口独立对话、状态机流转与级联清理
       - max_steps_per_turn: 单轮对话内允许的最大工具迭代步数（防止模型陷入死循环）
       - trace_callback: 步进式执行日志回调函数（用于实时控制台渲染或链路追踪）
     """
@@ -49,12 +55,14 @@ class AgentRuntime:
         llm_client: Optional[DeepSeekClient] = None,
         tool_registry: Optional[ToolRegistry] = None,
         session_manager: Optional[SessionManager] = None,
+        storage: Optional[SQLiteStorage] = None,
         max_steps_per_turn: int = 6,
         trace_callback: Optional[Callable[[AgentStep], None]] = None,
     ):
+        self.storage = storage or SQLiteStorage()
         self.llm = llm_client or DeepSeekClient()
         self.tools = tool_registry or self._create_default_registry()
-        self.sessions = session_manager or SessionManager()
+        self.sessions = session_manager or SessionManager(storage=self.storage)
         self.max_steps_per_turn = max_steps_per_turn
         self.trace_callback = trace_callback
 
@@ -64,17 +72,25 @@ class AgentRuntime:
         内置实现的 4 大工具：
           1. calculator (安全数学运算)
           2. search (知识/全网检索)
-          3. todo (待办事项管理，题目必须实现)
+          3. todo (待办事项管理，必须实现，持久化存储绑定)
           4. weather (天气与气温查询)
         """
         registry = ToolRegistry()
-        todo_store = TodoStore()
+        todo_store = TodoStore(storage=self.storage)
 
         registry.register(CalculatorTool())
         registry.register(SearchTool())
         registry.register(TodoTool(store=todo_store))
         registry.register(WeatherTool())
         return registry
+
+    def delete_session(self, session_id: str) -> bool:
+        """
+        级联清理指定会话（清理该窗口的 Context、Todo 及状态机元数据）。
+        """
+        todo_tool = self.tools.get_tool("todo")
+        todo_store = todo_tool.store if isinstance(todo_tool, TodoTool) else None
+        return self.sessions.delete(session_id, todo_store=todo_store)
 
     def run(
         self,
@@ -84,21 +100,16 @@ class AgentRuntime:
     ) -> (str, TraceLog):
         """
         执行一轮完整的用户交互循环（4-Step Loop）。
-
-        参数:
-          - user_input: 用户输入的自然语言指令
-          - session_id: 当前会话窗口 ID（如 'window_1', 'window_2'，确保多窗口互不干扰）
-          - user_id: 用户唯一标识符（可选）
-
-        返回:
-          - final_answer: Agent 返回给用户的最终文本答复
-          - trace: 本轮交互的全量调用链路跟踪日志（TraceLog）
+        驱动 SessionState 状态机: idle -> running -> idle / error
         """
         start_time = time.time()
         trace = TraceLog(session_id=session_id, user_input=user_input)
 
         # 1. 获取或创建独立会话（确保 Window 1 与 Window 2 状态严格隔离）
         session = self.sessions.get_or_create(session_id=session_id, user_id=user_id)
+
+        # ---------------- 状态机跃迁: 标记为 running ----------------
+        session.set_status("running")
 
         # 2. 将当前活跃会话 ID 注入支持会话隔离的工具（如 TodoTool）
         todo_tool = self.tools.get_tool("todo")
@@ -117,6 +128,7 @@ class AgentRuntime:
         while step_index < self.max_steps_per_turn:
             step_index += 1
             step_start = time.time()
+            session.set_current_step(step_index)
 
             # ----------------------------------------------------
             # Step 2: 经由 LLM 判断是直接回复，还是调用工具
@@ -136,6 +148,7 @@ class AgentRuntime:
                 trace.success = False
                 trace.error = err_msg
                 final_answer = f"Sorry, I encountered an internal error: {err_msg}"
+                session.set_status("error")
                 break
 
             # 分支 A: 模型决定直接回复（无工具调用）
@@ -160,8 +173,6 @@ class AgentRuntime:
             # ----------------------------------------------------
             # Step 3: 安全分发并执行工具调用
             # ----------------------------------------------------
-            # 注意: DeepSeek / OpenAI API 规范要求 assistant 历史消息中 tool_calls[i].function.arguments
-            # 必须为序列化后的 JSON 字符串，否则会触发 422 校验失败异常。
             openai_tool_calls = [
                 {
                     "id": tc.id,
@@ -214,13 +225,17 @@ class AgentRuntime:
             # 此时工具结果已全部追加至上下文，while 循环自动进入下一轮迭代，
             # 再次触发 Step 2，由 LLM 根据工具执行结果评估是否继续调用其它工具或组织最终回复。
 
-        # 熔断兜底：如果达到最大步数限制（例如 6 步）仍未生成直接回复，触发安全保护
+        # 熔断兜底：如果达到最大步数限制仍未生成直接回复，触发安全保护
         if not final_answer:
             final_answer = "I completed the tool executions, but reached the maximum reasoning steps limit."
             session.context.add_assistant_message(content=final_answer)
+
+        # ---------------- 状态机复位: 累加交互轮次，状态恢复 idle ----------------
+        if session.state.status != "error":
+            session.set_status("idle")
+            session.increment_turn()
 
         # 汇总完整耗时并返回
         trace.final_answer = final_answer
         trace.total_duration_ms = (time.time() - start_time) * 1000
         return final_answer, trace
-

@@ -170,17 +170,24 @@ class SearchTool(BaseTool):
 
 class TodoStore:
     """
-    待办事项内存持久化存储引擎。
-    核心特性: 强制按 session_id 进行物理分桶隔离，避免不同窗口之间的待办事项交叉污染。
+    待办事项持久化存储引擎 (v2 持久化增强版)。
+    核心特性:
+      1. 默认对接 SQLiteStorage 持久化落盘，进程重启后数据无损恢复；
+      2. 强制按 session_id 进行物理分桶隔离，避免不同窗口之间的待办交叉污染；
+      3. 支持 Session 销毁时的级联物理删除，彻底避免孤儿数据。
     """
 
-    def __init__(self):
-        # 存储结构: Dict[session_id, List[TodoItem]]
+    def __init__(self, storage: Optional[Any] = None):
+        self.storage = storage
+        # 内存回退字典（若未注入 SQLiteStorage 引擎时使用）
         self._todos: Dict[str, List[Dict[str, Any]]] = {}
         self._counter: int = 1
 
     def add(self, session_id: str, title: str, priority: str = "normal") -> Dict[str, Any]:
         """为指定会话添加一条待办"""
+        if self.storage:
+            return self.storage.add_todo(session_id, title=title, priority=priority)
+
         item = {
             "id": self._counter,
             "title": title,
@@ -195,10 +202,15 @@ class TodoStore:
 
     def list(self, session_id: str) -> List[Dict[str, Any]]:
         """获取指定会话的所有待办清单"""
+        if self.storage:
+            return self.storage.list_todos(session_id)
         return self._todos.get(session_id, [])
 
     def complete(self, session_id: str, todo_id: int) -> Optional[Dict[str, Any]]:
         """将指定会话中的某项待办标记为已完成"""
+        if self.storage:
+            return self.storage.complete_todo(session_id, todo_id)
+
         for item in self._todos.get(session_id, []):
             if item["id"] == todo_id:
                 item["completed"] = True
@@ -207,6 +219,9 @@ class TodoStore:
 
     def delete(self, session_id: str, todo_id: int) -> bool:
         """删除指定会话中的某项待办"""
+        if self.storage:
+            return self.storage.delete_todo(session_id, todo_id)
+
         items = self._todos.get(session_id, [])
         for i, item in enumerate(items):
             if item["id"] == todo_id:
@@ -215,8 +230,11 @@ class TodoStore:
         return False
 
     def clear(self, session_id: str) -> None:
-        """清空指定会话的待办"""
-        self._todos[session_id] = []
+        """清空指定会话的待办（级联清理）"""
+        if self.storage:
+            self.storage.clear_todos(session_id)
+        else:
+            self._todos[session_id] = []
 
 
 class TodoTool(BaseTool):

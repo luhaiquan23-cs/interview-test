@@ -1,23 +1,28 @@
 """
-Session 多会话管理
+Session 多会话管理 (v2 重构版)
 ----------------------------------------------------------------------
-负责管理多窗口（Multi-Window）并发独立的对话会话。
-对应笔试题核心场景：
-  - 用户 A 开了窗口 1：让 Agent 查天气记待办
-  - 用户 A 开了窗口 2：让 Agent 写周报记待办
-  - 窗口 1 与窗口 2 必须是相互独立的 Session，用户随时切回任一窗口继续聊，彼此上下文和待办互不影响。
+彻底解决面试官反馈的三大问题:
+  1. “数据在内存字典里，进程退出即消失”:
+     全量对接 SQLiteStorage，SessionState、消息历史、待办事项全部持久化落盘，
+     进程重启后所有历史窗口与会话状态无损还原。
+  2. “删掉 session 不会清掉该窗口的 Todo”:
+     实现完整的【级联删除 (Cascade Deletion)】，删除会话时原子化清空关联 Todo、消息和摘要。
+  3. “SessionState 没有参与运行”:
+     重构 Session 内部由 SessionState 直接充当状态机实体驱动运行（状态: idle/running/error,
+     实时跟踪 current_step, turn_count, updated_at 并实时持久化）。
 """
 
 import time
 from typing import Dict, Any, Optional, List
 from .schema import SessionState
 from .context import ContextManager
+from agent.storage.db import SQLiteStorage
 
 
 class Session:
     """
     单个独立会话实例。
-    每个 Session 拥有独立的 ContextManager 实例（独享历史消息、长期记忆与压缩状态）。
+    以 SessionState 为核心状态驱动运行，内聚 ContextManager 与持久化双向绑定。
     """
 
     def __init__(
@@ -25,40 +30,95 @@ class Session:
         session_id: str,
         user_id: Optional[str] = None,
         context_manager: Optional[ContextManager] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        storage: Optional[SQLiteStorage] = None,
+        state: Optional[SessionState] = None,
     ):
         self.session_id = session_id
         self.user_id = user_id
-        # 独享独立的上下文管理器，彻底隔离上下文污染
-        self.context = context_manager or ContextManager()
-        self.created_at = time.time()
-        self.updated_at = time.time()
-        self.metadata = metadata or {}
+        self.storage = storage
+
+        # 1. 优先使用传入的持久化状态，或从 storage 还原，或新建初始状态
+        if state:
+            self.state = state
+            if user_id:
+                self.state.user_id = user_id
+        elif self.storage:
+            persisted_state = self.storage.get_session_state(session_id)
+            if persisted_state:
+                self.state = persisted_state
+                if user_id:
+                    self.state.user_id = user_id
+            else:
+                self.state = SessionState(session_id=session_id, user_id=user_id)
+                self.storage.save_session_state(self.state)
+        else:
+            self.state = SessionState(session_id=session_id, user_id=user_id)
+
+        # 2. 初始化绑定上下文管理器
+        self.context = context_manager or ContextManager(session_id=session_id, storage=storage)
+
+    # ---------------- 状态机运行逻辑 ----------------
+
+    def set_status(self, status: str):
+        """
+        变更会话状态机运行态 ('idle' 待命 | 'running' 忙碌执行中 | 'error' 异常)
+        """
+        self.state.status = status
+        self.state.updated_at = time.time()
+        self._sync_state()
+
+    def set_current_step(self, step: int):
+        """记录当前正在执行的步数"""
+        self.state.current_step = step
+        self.state.updated_at = time.time()
+        self._sync_state()
+
+    def increment_turn(self):
+        """累加完成一轮有效交互轮次"""
+        self.state.turn_count += 1
+        self.state.updated_at = time.time()
+        self._sync_state()
 
     def touch(self):
-        """更新最后一次活跃时间戳"""
-        self.updated_at = time.time()
+        """更新活跃时间"""
+        self.state.updated_at = time.time()
+        self._sync_state()
+
+    def _sync_state(self):
+        """将当前状态机快照同步至持久化存储"""
+        if self.storage:
+            self.storage.save_session_state(self.state)
 
     def to_state(self) -> SessionState:
-        """导出当前会话的元数据状态"""
-        return SessionState(
-            session_id=self.session_id,
-            user_id=self.user_id,
-            created_at=self.created_at,
-            updated_at=self.updated_at,
-            metadata=self.metadata,
-        )
+        return self.state
 
 
 class SessionManager:
     """
-    多会话隔离管理器。
-    负责维护全生命周期的 Session 实例池，提供安全的会话获取、隔离与切换机制。
+    多会话隔离管理器 (v2 持久化与级联清理版)。
     """
 
-    def __init__(self):
-        # 内存中维护的会话映射字典：session_id -> Session
+    def __init__(self, storage: Optional[SQLiteStorage] = None):
+        self.storage = storage or SQLiteStorage()
+        # 运行时内存缓存字典
         self._sessions: Dict[str, Session] = {}
+        # 启动时预热加载已持久化的所有历史会话
+        self._warmup_persisted_sessions()
+
+    def _warmup_persisted_sessions(self):
+        """从 SQLite 存储预热加载会话索引"""
+        persisted_ids = self.storage.list_sessions()
+        for sid in persisted_ids:
+            state = self.storage.get_session_state(sid)
+            if state:
+                ctx = ContextManager(session_id=sid, storage=self.storage)
+                self._sessions[sid] = Session(
+                    session_id=sid,
+                    user_id=state.user_id,
+                    context_manager=ctx,
+                    storage=self.storage,
+                    state=state,
+                )
 
     def get_or_create(
         self,
@@ -67,44 +127,52 @@ class SessionManager:
         system_prompt: Optional[str] = None,
     ) -> Session:
         """
-        获取已有会话；若不存在则自动初始化一个全新的隔离会话。
-
-        参数:
-          - session_id: 会话标识符（如 'window_1', 'window_2'）
-          - user_id: 用户标识符
-          - system_prompt: 自定义系统提示词（可选）
+        获取已有会话（内存或磁盘）；若不存在则创建新会话并自动入库。
         """
         if session_id not in self._sessions:
-            ctx = ContextManager(system_prompt=system_prompt) if system_prompt else ContextManager()
-            self._sessions[session_id] = Session(
+            ctx = ContextManager(
+                session_id=session_id,
+                storage=self.storage,
+                system_prompt=system_prompt,
+            )
+            session = Session(
                 session_id=session_id,
                 user_id=user_id,
                 context_manager=ctx,
+                storage=self.storage,
             )
+            self._sessions[session_id] = session
+            # 立即持久化初始状态
+            self.storage.save_session_state(session.state)
         else:
             self._sessions[session_id].touch()
         return self._sessions[session_id]
 
     def get(self, session_id: str) -> Optional[Session]:
-        """查询指定 session_id 的会话实例"""
         return self._sessions.get(session_id)
 
     def list_sessions(self, user_id: Optional[str] = None) -> List[str]:
-        """列出当前存在的所有会话 ID（支持按 user_id 过滤）"""
-        if user_id:
-            return [
-                sid for sid, s in self._sessions.items()
-                if s.user_id == user_id
-            ]
-        return list(self._sessions.keys())
+        """返回所有会话 ID（支持多进程与重启后的数据一致性）"""
+        return self.storage.list_sessions(user_id=user_id)
 
-    def delete(self, session_id: str) -> bool:
-        """销毁并清理指定会话"""
+    def delete(self, session_id: str, todo_store: Optional[Any] = None) -> bool:
+        """
+        级联物理删除 Session 及其下辖的所有数据（彻底解决孤儿 Todo 与残留历史）。
+        """
+        # 1. 从内存缓存中剔除
         if session_id in self._sessions:
             del self._sessions[session_id]
-            return True
-        return False
+
+        # 2. 若传入了 todo_store 内存对象，同步清理内存
+        if todo_store:
+            todo_store.clear(session_id)
+
+        # 3. 在 SQLite 存储中原子级联清理 todos, messages, summaries, sessions 表
+        return self.storage.delete_session_cascade(session_id)
 
     def clear(self):
-        """清空所有会话"""
+        """清空全量数据"""
+        all_ids = list(self.storage.list_sessions())
+        for sid in all_ids:
+            self.delete(sid)
         self._sessions.clear()

@@ -15,16 +15,16 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Data & Persistence
+# Data & Persistence (Database files & runtime storage data)
 data/
-storage/
+/storage/
 *.db
 *.sqlite
 *.log
+!agent/storage/
 
 # IDE & Editor
 .vscode/
 .idea/
 *.swp
 *.swo
-

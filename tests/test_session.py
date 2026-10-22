@@ -9,6 +9,7 @@ Session 会话隔离与生命周期单元测试 (Unit Tests for Session)
 
 import pytest
 from agent.core.session import SessionManager
+from agent.storage.db import SQLiteStorage
 
 
 def test_session_isolation():
@@ -18,7 +19,8 @@ def test_session_isolation():
       用户 A 开启窗口 2: 写周报记待办
       验证窗口 1 与窗口 2 的上下文历史绝对隔离，彼此无法看到对方的对话内容。
     """
-    manager = SessionManager()
+    storage = SQLiteStorage(":memory:")
+    manager = SessionManager(storage=storage)
 
     # 1. 用户 A 在窗口 1 发送消息
     s1 = manager.get_or_create(session_id="window_1", user_id="user_A")
@@ -49,7 +51,8 @@ def test_session_reconnect_and_continue():
     测试窗口会话恢复:
     用户在窗口 1 聊完后切到窗口 2，再切回窗口 1，依然能够获取先前的完整会话上下文。
     """
-    manager = SessionManager()
+    storage = SQLiteStorage(":memory:")
+    manager = SessionManager(storage=storage)
 
     # 窗口 1 写入
     s1 = manager.get_or_create(session_id="window_1")
@@ -68,7 +71,8 @@ def test_session_reconnect_and_continue():
 
 def test_session_lifecycle():
     """测试会话管理器基础生命周期（按用户检索、销毁删除）"""
-    manager = SessionManager()
+    storage = SQLiteStorage(":memory:")
+    manager = SessionManager(storage=storage)
     s1 = manager.get_or_create("s1", user_id="user_1")
     s2 = manager.get_or_create("s2", user_id="user_1")
     s3 = manager.get_or_create("s3", user_id="user_2")

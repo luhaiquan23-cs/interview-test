@@ -4,7 +4,7 @@ Context 上下文管理器单元测试 (Unit Tests for Context)
 覆盖范围:
   1. 基础上下文装配与轮次统计 (Turn Count);
   2. 长期记忆 (Memory) 动态注入与系统提示词 (System Prompt) 联动;
-  3. 基础上下文压缩 (Compaction): 超过阈值时触发滑动窗口切分与结构化摘要提炼;
+  3. 原子化轮次上下文压缩 (Atomic Turn-based Compaction);
   4. 多轮追问支持 (Follow-up Continuity): 验证上下文对追问语境的保真度。
 """
 
@@ -15,7 +15,7 @@ from agent.core.schema import Message
 
 def test_context_basic():
     """测试基础消息添加、轮次统计与初始 System Prompt 校验"""
-    ctx = ContextManager(max_turns=5, compression_threshold=10)
+    ctx = ContextManager(max_turns=5)
     assert len(ctx.get_messages()) == 1
     assert ctx.get_messages()[0].role == "system"
 
@@ -40,23 +40,27 @@ def test_context_memory_injection():
 
 def test_context_compaction():
     """
-    测试滑动窗口基础压缩 (Basic Context Compaction):
-    设置 threshold=4, keep_recent=2。当消息数超标时，远期消息压缩为摘要，近期消息原样保留。
+    测试原子化轮次压缩 (Atomic Turn-based Compaction):
+    设置 max_turns=2, keep_recent_turns=1。当超过 2 个完整轮次时，远期轮次压缩为滚动摘要，近期轮次原样保留。
     """
-    ctx = ContextManager(compression_threshold=4, keep_recent_messages=2)
+    ctx = ContextManager(max_turns=2, keep_recent_turns=1)
 
-    # 连续追加 5 条对话消息，触发压缩机制
+    # Turn 1
     ctx.add_user_message("Message 1")
     ctx.add_assistant_message("Reply 1")
+
+    # Turn 2
     ctx.add_user_message("Message 2")
     ctx.add_assistant_message("Reply 2")
-    ctx.add_user_message("Message 3")  # 超过阈值 4 -> 自动触发压缩
+
+    # Turn 3 (触发压缩)
+    ctx.add_user_message("Message 3")
 
     messages = ctx.get_messages()
-    # 验证第 0 条始终是包含压缩摘要的系统消息
+    # 验证第 0 条始终是包含滚动压缩摘要的系统消息
     assert messages[0].role == "system"
-    assert "Summary of Prior Conversation" in messages[0].content
-    assert "User asked: Message 1" in messages[0].content
+    assert "Rolling Summary of Prior Conversation" in messages[0].content
+    assert "User: Message 1" in messages[0].content
 
     # 验证最近的 Message 3 被完整保留在近期上下文中
     recent_contents = [m.content for m in messages[1:]]

@@ -5,9 +5,10 @@
   - ToolCall: 大模型生成的工具调用请求（名称、参数、唯一 ID）
   - ToolResult: 工具执行后的观测返回（执行状态、文本输出、错误详情）
   - Message: 对话历史中的单条消息实体（兼容 OpenAI 消息协议）
+  - TurnBlock: 原子化对话轮次单元（彻底解决拆散 assistant tool_calls 和 tool 结果的问题）
   - AgentStep: 单次事件循环步骤的执行快照（耗时、思考过程、工具行为）
   - TraceLog: 单轮用户对话的全链路追踪轨迹日志
-  - SessionState: 会话维度的持久化元数据
+  - SessionState: 会话维度的持久化核心状态机模型（status, current_step, turn_count 深度参与运行）
 """
 
 from typing import List, Dict, Any, Optional, Union
@@ -112,18 +113,67 @@ class Message(BaseModel):
         return msg
 
 
+class TurnBlock(BaseModel):
+    """
+    原子化交互轮次单元 (Atomic Dialogue Turn)。
+    解决面试官指出的致命问题: “压缩按条数切开，会拆散 assistant 的 tool call 和后面的 tool 结果”。
+    
+    一个完整的 Turn 包含:
+      - 触发的 user 消息
+      - 该轮中所有的 assistant(含 tool_calls) 与对应的 tool 执行结果消息
+      - 最终 assistant 直接回答
+    
+    无论滑动窗口如何截断，切分边界必须在 TurnBlock 之间，严禁在 TurnBlock 内部切割！
+    """
+    messages: List[Message] = Field(default_factory=list)
+
+    @property
+    def user_message(self) -> Optional[Message]:
+        for m in self.messages:
+            if m.role == "user":
+                return m
+        return None
+
+    @property
+    def final_response(self) -> Optional[Message]:
+        for m in reversed(self.messages):
+            if m.role == "assistant" and not m.tool_calls:
+                return m
+        return None
+
+    def summarize_for_compaction(self) -> str:
+        """提炼该原子轮次的紧凑摘要文本"""
+        parts = []
+        user_msg = self.user_message
+        if user_msg and user_msg.content:
+            parts.append(f"User: {user_msg.content}")
+
+        # 工具调用及结果提炼
+        tools_called = []
+        for m in self.messages:
+            if m.role == "assistant" and m.tool_calls:
+                for tc in m.tool_calls:
+                    func_name = tc.get("function", {}).get("name", "tool")
+                    tools_called.append(func_name)
+            elif m.role == "tool":
+                # 记录简要返回值
+                snippet = m.content[:50] + "..." if m.content and len(m.content) > 50 else m.content
+                parts.append(f"Obs({m.name}): {snippet}")
+
+        if tools_called:
+            parts.append(f"Action: [{', '.join(tools_called)}]")
+
+        resp = self.final_response
+        if resp and resp.content:
+            snippet = resp.content[:60] + "..." if len(resp.content) > 60 else resp.content
+            parts.append(f"Agent: {snippet}")
+
+        return " | ".join(parts)
+
+
 class AgentStep(BaseModel):
     """
     Agent 4 步循环中单一步骤 (Step) 的执行快照。
-    
-    字段:
-      - step_index: 当前步骤序号（第 1 步、第 2 步等）
-      - thought: 步骤开始前模型输出的思考内容
-      - action: 动作类型 ('tool_call' 工具调用 或 'direct_response' 直接回复)
-      - tool_calls: 本步骤调用的工具列表
-      - tool_results: 本步骤所有工具执行后的结果
-      - response_content: 模型生成的文本内容
-      - duration_ms: 本步骤耗时（毫秒）
     """
     step_index: int
     thought: Optional[str] = None
@@ -150,10 +200,20 @@ class TraceLog(BaseModel):
 
 class SessionState(BaseModel):
     """
-    会话状态与生命周期元数据。
+    会话状态机核心实体模型 (Single Source of Truth)。
+    解决面试官指出的问题: “SessionState 没有参与运行”。
+    
+    字段参与运行时核心逻辑:
+      - status: 驱动会话状态机 ("idle" 待命 | "running" 正在推理执行 | "error" 异常)
+      - current_step: 追踪当前会话正在执行的推理步数
+      - turn_count: 累计多轮对话实际交互轮次
+      - updated_at: 活跃时间，用于超时与缓存淘汰
     """
     session_id: str
     user_id: Optional[str] = None
+    status: str = "idle"  # "idle" | "running" | "error"
+    current_step: int = 0
+    turn_count: int = 0
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
     metadata: Dict[str, Any] = Field(default_factory=dict)

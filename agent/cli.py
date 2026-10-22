@@ -178,6 +178,16 @@ def main():
                 console.print(f"[yellow]Context reset for session {current_session}.[/yellow]")
                 continue
 
+            # 8. 级联删除指定窗口及下辖 Todo (/delete <session_id>)
+            elif prompt.startswith("/delete "):
+                target_sid = prompt.split(" ", 1)[1].strip()
+                runtime.delete_session(target_sid)
+                console.print(f"[bold red]Cascaded deleted session and all its todos:[/bold red] [cyan]{target_sid}[/cyan]")
+                if target_sid == current_session:
+                    current_session = "default"
+                    console.print(f"[yellow]Switched active window to:[/yellow] [cyan]{current_session}[/cyan]")
+                continue
+
             # ---------------- 触发 Agent 核心执行循环 ----------------
             console.print(f"[dim]Agent thinking...[/dim]")
             answer, trace = runtime.run(prompt, session_id=current_session)
