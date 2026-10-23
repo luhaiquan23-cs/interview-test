@@ -133,3 +133,4 @@ python -m pytest -v
 5. `test_session_state_machine_transition`: ✅ **PASSED** (状态机 idle/running 流转与轮次持久化校验)
 
 再次感谢评审老师的专业指导，期待能与您在下一轮技术面试中有更深入的交流！
+
